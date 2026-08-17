@@ -1,0 +1,17 @@
+# build products (keep the directory itself)
+build/*
+!build/.gitkeep
+*.o
+*.exe
+
+# generated data: solver JSONs, sweep caches, figures
+data/*
+!data/.gitkeep
+*.png
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+*.egg-info/
