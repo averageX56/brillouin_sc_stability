@@ -1,0 +1,2 @@
+tqdm>=4.66
+colorama>=0.4.6; platform_system == "Windows"

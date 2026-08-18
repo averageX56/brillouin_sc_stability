@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sweep_temperature_otterstrom.py — sweep bath temperature T and, for every T,
+"""nth_sweep.py — sweep bath temperature T and, for every T,
 run a full pump sweep with the C++ Brillouin SDE solver.
 
 The user-facing thermal control parameter is temperature in kelvin.  For each
@@ -16,7 +16,7 @@ There is no command-line interface for n_th, T-min/T-max, or a temperature
 grid: edit that list directly.  For each T the Bose--Einstein occupation is
 computed internally and passed to the low-level solver.
 
-Produces one aggregated JSON (default temperature_sweep.json) holding every
+Produces one aggregated JSON (default nth_sweep.json) holding every
 per-E record for every temperature, plus per-temperature solver JSONs in a
 cache directory.
 
@@ -24,8 +24,8 @@ Usage
 -----
     make
     # Edit TEMPERATURES_K below, then:
-    python3 scripts/sweep_temperature_otterstrom.py --dry-run --no-log
-    python3 scripts/sweep_temperature_otterstrom.py --threads 7
+    python3 scripts/nth_sweep.py --dry-run --no-log
+    python3 scripts/nth_sweep.py --threads 7
 """
 
 from __future__ import annotations
@@ -35,11 +35,19 @@ import hashlib
 import json
 import math
 import os
+import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # keep the solver usable on a minimal cluster image
+    tqdm = None
 
 # Otterstrom et al., A silicon Brillouin laser (Science 2018), physical SI rates.
 # No frequency normalization is used here: every decay/coupling rate is passed to
@@ -106,7 +114,7 @@ E_MAX_DEFAULT = 10.0 * _E2_DEFAULT
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="temperature sweep for the Brillouin cascade SDE; edit TEMPERATURES_K in the script")
+    ap = argparse.ArgumentParser(description="temperature-driven n_th sweep for the Brillouin cascade SDE; edit TEMPERATURES_K in the script")
     ap.add_argument("--exe", default=None, help="solver binary (default ./sde_solver[.exe])")
     ap.add_argument("--no-make", action="store_true", help="skip running make first")
     # pump grid
@@ -122,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--scheme", default="splitting", choices=["splitting", "taylor15", "euler"])
     ap.add_argument("--noise", default="gauss", choices=["gauss", "telegraph"])
     ap.add_argument("--dt", type=float, default=1.0e-9,
-                    help="integration step in seconds (default 1 ns, as in Otterstrom et al.)")
+                    help="integration step in seconds (default 1 ns)")
     ap.add_argument("--n-paths", type=int, default=100)
     ap.add_argument("--thin", type=int, default=None,
                     help="record every thin-th step (default: derived from "
@@ -143,13 +151,13 @@ def parse_args() -> argparse.Namespace:
                     help="override burn steps (else derived from --burn-tau)")
     # bookkeeping
     ap.add_argument("--cache-dir", default=None,
-                    help="per-temperature solver JSONs (default <repo>/data/temperature_cache)")
+                    help="per-temperature solver JSONs (default <repo>/data/nth_cache)")
     ap.add_argument("--out", default=None,
-                    help="aggregated output (default <repo>/data/temperature_sweep.json)")
+                    help="aggregated output (default <repo>/data/nth_sweep.json)")
     ap.add_argument("--dry-run", action="store_true", help="print the plan, run nothing")
     ap.add_argument("--log", default=None,
                     help="progress log, mirrored from the console (default "
-                         "<repo>/data/sweep_temperature.log). Survives a frozen console.")
+                         "<repo>/data/sweep_nth.log). Survives a frozen console.")
     ap.add_argument("--no-log", action="store_true", help="do not write a log file")
     ap.add_argument("--timeout", type=float, default=0.0,
                     help="hard limit on a single solver call, seconds (0 = none). "
@@ -167,6 +175,11 @@ def parse_args() -> argparse.Namespace:
                          "phase a seemingly stuck run is sitting in.")
     ap.add_argument("--calibrate", action="store_true",
                     help="time a short run first and print an estimated wall time")
+    ap.add_argument("--temperature-workers", type=int, default=1,
+                    help="number of temperatures evaluated concurrently (default 1)")
+    ap.add_argument("--worker-devices", default="",
+                    help="comma-separated logical CUDA device ids, one per worker; "
+                         "empty means ordinary CPU workers")
     return ap.parse_args()
 
 
@@ -243,13 +256,14 @@ class Log:
     The symptom is a run that looks frozen — last line stuck mid-sweep, zero CPU
     load, nothing corrupt — and it resumes the moment you press Enter or Esc.
     With a log file the real progress is visible regardless of what the console
-    is doing, and `type data\\sweep_temperature.log` tells you where the run actually is.
+    is doing, and `type data\\sweep_nth.log` tells you where the run actually is.
     """
 
     def __init__(self, path: Path | None, echo: bool = True):
         self.fh = None
         self.path = path
         self.echo = echo
+        self.lock = threading.Lock()
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
             self.fh = open(path, "a", encoding="utf-8", buffering=1)
@@ -257,13 +271,17 @@ class Log:
                           f"{' '.join(sys.argv)} ===\n")
 
     def __call__(self, msg: str = "", console: bool = True) -> None:
-        if console:
-            try:
-                print(msg, flush=True)
-            except OSError:
-                pass  # console gone; the file still has it
-        if self.fh:
-            self.fh.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        with self.lock:
+            if console:
+                try:
+                    if tqdm is not None:
+                        tqdm.write(msg)
+                    else:
+                        print(msg, flush=True)
+                except OSError:
+                    pass  # console gone; the file still has it
+            if self.fh:
+                self.fh.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
 
     def child_handle(self):
         """Raw file handle for a child process to write into (no pipe)."""
@@ -278,7 +296,8 @@ class Log:
 
 
 def launch_solver(cmd: list[str], log: "Log", timeout: float | None,
-                  stall: float | None) -> int:
+                  stall: float | None, env: dict[str, str] | None = None,
+                  progress_desc: str | None = None, progress_position: int = 0) -> int:
     """Run the solver with its output going DIRECTLY into the log file.
 
     Deliberately no pipe. An earlier version piped the child's stdout into this
@@ -300,37 +319,89 @@ def launch_solver(cmd: list[str], log: "Log", timeout: float | None,
     console blocks, only that thread waits — the solver keeps running.
     """
     fh = log.child_handle()
+    tail_path = log.path
+    temporary_fh = None
+    if fh is None and progress_desc is not None:
+        temporary_fh = tempfile.NamedTemporaryFile(
+            mode="w+", encoding="utf-8", prefix="brillouin_progress_",
+            suffix=".log", delete=False)
+        fh = temporary_fh
+        tail_path = Path(temporary_fh.name)
     stop = threading.Event()
 
     def tail(start: int) -> None:
         pos = start
-        while not stop.is_set():
+        bar = None
+        shown = 0
+        pending = ""
+        while True:
             try:
-                with open(log.path, "r", encoding="utf-8", errors="replace") as r:
+                with open(tail_path, "r", encoding="utf-8", errors="replace") as r:
                     r.seek(pos)
                     chunk = r.read()
                     pos = r.tell()
             except OSError:
                 chunk = ""
             if chunk:
-                try:
-                    sys.stdout.write(chunk)
-                    sys.stdout.flush()
-                except OSError:
-                    pass  # console gone or blocked; the file still has everything
+                ordinary = []
+                pending += chunk
+                lines = pending.splitlines(keepends=True)
+                if lines and not lines[-1].endswith(("\n", "\r")):
+                    pending = lines.pop()
+                else:
+                    pending = ""
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped.startswith("SDE_PROGRESS "):
+                        fields = stripped.split()
+                        if len(fields) == 3:
+                            try:
+                                current, total = int(fields[1]), int(fields[2])
+                            except ValueError:
+                                ordinary.append(line)
+                                continue
+                            if tqdm is not None:
+                                if bar is None:
+                                    bar = tqdm(total=total, desc=progress_desc or "CUDA",
+                                               unit="step", position=progress_position,
+                                               dynamic_ncols=True, leave=True)
+                                if current > bar.n:
+                                    bar.update(current - bar.n)
+                            elif current == total or current - shown >= max(1, total // 20):
+                                shown = current
+                                ordinary.append(f"{progress_desc or 'CUDA'}: {current}/{total} steps\n")
+                        continue
+                    if log.echo:
+                        ordinary.append(line)
+                if ordinary:
+                    try:
+                        text = "".join(ordinary)
+                        if tqdm is not None:
+                            tqdm.write(text.rstrip("\r\n"))
+                        else:
+                            sys.stdout.write(text)
+                            sys.stdout.flush()
+                    except OSError:
+                        pass  # console gone or blocked; the file still has everything
             else:
+                if stop.is_set():
+                    break
                 stop.wait(0.5)
+        if bar is not None:
+            if bar.total is not None and bar.n < bar.total:
+                bar.update(bar.total - bar.n)
+            bar.close()
 
     t = None
-    if fh is not None and log.path is not None and log.echo:
+    if fh is not None and tail_path is not None and (log.echo or progress_desc is not None):
         fh.flush()
-        t = threading.Thread(target=tail, args=(log.path.stat().st_size,), daemon=True)
+        t = threading.Thread(target=tail, args=(tail_path.stat().st_size,), daemon=True)
         t.start()
 
     reason = []
     try:
         proc = subprocess.Popen(cmd, stdout=(fh if fh is not None else None),
-                                stderr=subprocess.STDOUT)
+                                stderr=subprocess.STDOUT, env=env)
         t0 = time.time()
         last_size, last_growth = -1, time.time()
         while True:
@@ -343,9 +414,9 @@ def launch_solver(cmd: list[str], log: "Log", timeout: float | None,
             if timeout and now - t0 > timeout:
                 reason.append(f"hard --timeout {timeout:g} s")
                 break
-            if stall and log.path is not None:
+            if stall and tail_path is not None:
                 try:
-                    size = log.path.stat().st_size
+                    size = tail_path.stat().st_size
                 except OSError:
                     size = last_size
                 if size != last_size:
@@ -365,6 +436,13 @@ def launch_solver(cmd: list[str], log: "Log", timeout: float | None,
             t.join(timeout=2.0)
         if fh is not None:
             fh.flush()
+        if temporary_fh is not None:
+            temporary_name = temporary_fh.name
+            temporary_fh.close()
+            try:
+                Path(temporary_name).unlink()
+            except OSError:
+                pass
     return rc
 
 
@@ -454,7 +532,8 @@ def param_fingerprint(args, n_steps: int, burn: int) -> str:
 
 
 def run_one(exe: Path, T_K: float, nth: float, args, n_steps: int, burn: int, cache: Path,
-            log: "Log") -> dict:
+            log: "Log", solver_env: dict[str, str] | None = None,
+            progress_position: int = 0) -> dict:
     """Run (or reuse) one full pump sweep at fixed bath temperature."""
     fp = param_fingerprint(args, n_steps, burn)
     out = cache / f"T_{T_K:.9g}K_{fp}.json"
@@ -498,13 +577,15 @@ def run_one(exe: Path, T_K: float, nth: float, args, n_steps: int, burn: int, ca
         cmd.append("--verbose")
     if args.threads:
         cmd += ["--threads", str(args.threads)]
-    log(f"    launching: {' '.join(cmd)}", console=False)
+    log(f"    launching: {shlex.join(cmd)}", console=False)
     rc = launch_solver(cmd, log,
                        args.timeout if args.timeout > 0 else None,
-                       args.stall_timeout if args.stall_timeout > 0 else None)
+                       args.stall_timeout if args.stall_timeout > 0 else None,
+                       env=solver_env, progress_desc=f"T={T_K:g} K",
+                       progress_position=progress_position)
     if rc != 0:
         log(f"error: solver exited with code {rc}")
-        sys.exit(f"error: solver exited with code {rc} on\n  " + " ".join(cmd)
+        sys.exit(f"error: solver exited with code {rc} on\n  " + shlex.join(cmd)
                  + "\n(run that command by hand to see the full message)")
     if not out.exists():
         sys.exit(f"error: solver reported success but {out} was not written")
@@ -516,11 +597,11 @@ def main() -> None:
     args = parse_args()
     root = Path(__file__).resolve().parent.parent          # repo root
     exe = Path(args.exe) if args.exe else find_exe(root)
-    out_path = Path(args.out) if args.out else root / "data" / "temperature_sweep.json"
-    cache = Path(args.cache_dir) if args.cache_dir else root / "data" / "temperature_cache"
+    out_path = Path(args.out) if args.out else root / "data" / "nth_sweep.json"
+    cache = Path(args.cache_dir) if args.cache_dir else root / "data" / "nth_cache"
 
     log = Log(None if args.no_log else
-              (Path(args.log) if args.log else root / "data" / "sweep_temperature.log"))
+              (Path(args.log) if args.log else root / "data" / "sweep_nth.log"))
 
     T_grid = [float(T_K) for T_K in TEMPERATURES_K]
     if not T_grid:
@@ -532,7 +613,31 @@ def main() -> None:
     if len(set(T_grid)) != len(T_grid):
         sys.exit("error: TEMPERATURES_K contains duplicate temperatures")
 
+    if args.g <= 0.0 or args.Gamma <= 0.0 or args.gamma_opt <= 0.0:
+        sys.exit("error: g, Gamma, and gamma-opt must all be positive")
+    if args.dt <= 0.0 or args.nE < 2 or args.n_paths < 1 or args.N_photons < 2:
+        sys.exit("error: require dt > 0, nE >= 2, n-paths >= 1, and N-photons >= 2")
+    if args.E_min < 0.0 or args.E_max <= args.E_min:
+        sys.exit("error: require 0 <= E-min < E-max")
+    if args.burn_tau < 0.0 or args.record_tau <= 0.0 or args.samples_per_tau <= 0.0:
+        sys.exit("error: require burn-tau >= 0, record-tau > 0, and samples-per-tau > 0")
+    if args.temperature_workers < 1:
+        sys.exit("error: --temperature-workers must be >= 1")
+    try:
+        worker_devices = ([int(x.strip()) for x in args.worker_devices.split(",") if x.strip()]
+                          if args.worker_devices else [])
+    except ValueError:
+        sys.exit("error: --worker-devices must be a comma-separated list of integers")
+    if any(d < 0 for d in worker_devices) or len(set(worker_devices)) != len(worker_devices):
+        sys.exit("error: --worker-devices must contain distinct non-negative ids")
+    if worker_devices and args.temperature_workers > len(worker_devices):
+        sys.exit("error: one concurrent temperature worker per CUDA device is allowed; "
+                 "reduce --temperature-workers or provide more --worker-devices")
+    args.temperature_workers = min(args.temperature_workers, len(T_grid))
+
     nth_grid = [nth_from_temperature(T_K) for T_K in T_grid]
+    if len(set(nth_grid)) != len(nth_grid):
+        sys.exit("error: two temperatures map to the same floating-point n_th; remove one")
 
     n_steps, burn = sampling_window(args)
     args.thin = choose_thin(args)
@@ -575,6 +680,10 @@ def main() -> None:
     total_sp = len(T_grid) * args.nE * n_steps * args.n_paths
     print(f"cost: {total_sp:.3g} step-paths in total "
           f"({len(T_grid)} temperatures x {args.nE} E x {n_steps} steps x {args.n_paths} paths)")
+    if args.temperature_workers > 1:
+        where = (f" on logical CUDA devices {worker_devices[:args.temperature_workers]}"
+                 if worker_devices else "")
+        print(f"temperature parallelism: {args.temperature_workers} workers{where}")
     if args.dry_run:
         print("\n--dry-run: nothing executed.")
         return
@@ -594,7 +703,7 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not args.no_log:
-        log(f"log file: {root / 'data' / 'sweep_temperature.log' if not args.log else args.log}")
+        log(f"log file: {root / 'data' / 'sweep_nth.log' if not args.log else args.log}")
 
     if args.calibrate:
         log(">> calibrating ...")
@@ -608,11 +717,51 @@ def main() -> None:
             print("   calibration failed, skipping the estimate", file=sys.stderr)
 
     entries = []
-    t_start = time.time()
-    for i, (T_K, nth) in enumerate(zip(T_grid, nth_grid), 1):
-        log(f"[{i}/{len(T_grid)}] T = {T_K:g} K -> n_th = {nth:.8g} ...")
-        t_pt = time.time()
-        data = run_one(exe, T_K, nth, args, n_steps, burn, cache, log)
+    temperature_data: list[dict | None] = [None] * len(T_grid)
+
+    def run_temperature_queue(slot: int) -> None:
+        """Run one FIFO queue per device, so two jobs never collide on one GPU."""
+        device = worker_devices[slot] if worker_devices else None
+        for index in range(slot, len(T_grid), args.temperature_workers):
+            T_K, nth = T_grid[index], nth_grid[index]
+            device_text = f" GPU {device}" if device is not None else ""
+            log(f"[{index + 1}/{len(T_grid)}] T = {T_K:g} K -> "
+                f"n_th = {nth:.8g}{device_text} ...")
+            separate_log = args.temperature_workers > 1
+            worker_log_path = cache / "worker_logs" / f"T_{T_K:.9g}K.log"
+            worker_log = Log(worker_log_path, echo=False) if separate_log else log
+            solver_env = os.environ.copy()
+            if device is not None:
+                solver_env["SDE_CUDA_DEVICE"] = str(device)
+            t_pt = time.time()
+            try:
+                temperature_data[index] = run_one(
+                    exe, T_K, nth, args, n_steps, burn, cache, worker_log, solver_env,
+                    progress_position=slot)
+            except SystemExit as exc:
+                raise RuntimeError(f"temperature {T_K:g} K failed: {exc}") from exc
+            finally:
+                if separate_log:
+                    worker_log.close()
+            log(f"    completed T = {T_K:g} K on{device_text or ' worker'} "
+                f"[{(time.time() - t_pt) / 60:.1f} min]")
+
+    try:
+        with ThreadPoolExecutor(max_workers=args.temperature_workers,
+                                thread_name_prefix="temperature") as pool:
+            futures = [pool.submit(run_temperature_queue, slot)
+                       for slot in range(args.temperature_workers)]
+            for future in futures:
+                future.result()
+    except Exception as exc:
+        log.close()
+        sys.exit(f"error: parallel temperature sweep failed: {exc}")
+
+    # Aggregation is serial and follows TEMPERATURES_K, independent of completion order.
+    for i, (T_K, nth, data) in enumerate(zip(T_grid, nth_grid, temperature_data), 1):
+        if data is None:
+            log.close()
+            sys.exit(f"error: no result produced for T = {T_K:g} K")
         R = data["results"]
 
         def col(key, j):
@@ -658,16 +807,13 @@ def main() -> None:
         ph = entries[-1]["g2_0_phonon"]
         ph_fin = [v for v in ph[1] if v is not None and math.isfinite(v)]
         ph_txt = f"{sum(ph_fin) / len(ph_fin):.4f}" if ph_fin else "NaN"
-        el = time.time() - t_pt
-        done, left = i, len(T_grid) - i
-        eta = (time.time() - t_start) / done * left
         log(f"    g2_a2 range = {rng_txt}   <g2_b2> = {ph_txt}   diverged = {div}"
-            f"{f'   sub-threshold pts skipped: {n_sub}' if n_sub else ''}"
-            f"   [{el / 60:.1f} min, ETA {eta / 60:.0f} min]")
+            f"{f'   sub-threshold pts skipped: {n_sub}' if n_sub else ''}")
 
     result = {
         "meta": {
-            "kind": "temperature_sweep",
+            "kind": "nth_sweep",
+            "thermal_control": "TEMPERATURES_K in scripts/nth_sweep.py",
             "T_grid_K": T_grid,
             "nth_grid": nth_grid,
             "E_grid": linspace(args.E_min, args.E_max, args.nE),
@@ -688,11 +834,17 @@ def main() -> None:
             "nth_convention": "D0 = Gamma*nth/2, i.e. <|b_k|^2> = nth",
             "param_fingerprint": param_fingerprint(args, n_steps, burn),
             "phonon_init": "thermal: b = b_det + CN(0, D0/Gamma)",
+            "temperature_workers": args.temperature_workers,
+            "worker_devices": worker_devices[:args.temperature_workers],
         },
         "entries": entries,
     }
-    with open(out_path, "w") as f:
+    partial_out = Path(str(out_path) + ".partial")
+    with open(partial_out, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(partial_out, out_path)
     log(f"wrote {out_path}  ({len(entries)} temperature values)")
     log.close()
 
