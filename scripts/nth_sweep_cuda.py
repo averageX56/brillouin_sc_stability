@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """CUDA/C++ entry point for the temperature-driven Brillouin sweep.
 
-The temperature grid and all physical defaults stay in ``nth_sweep.py``.  This
-wrapper builds the independent CUDA solver, points the existing sweep driver at
-that binary, and uses separate cache/output/log paths so CPU and CUDA results
-can never be mixed accidentally.
+Edit only the USER CONFIGURATION block below for an ordinary run. Command-line
+options remain available for debugging, but are not required.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -22,6 +21,59 @@ ROOT = Path(__file__).resolve().parent.parent
 CUDA_SOURCE = ROOT / "cuda"
 CUDA_BUILD = ROOT / "build_cuda"
 CUDA_EXE = CUDA_BUILD / ("sde_solver_cuda.exe" if os.name == "nt" else "sde_solver_cuda")
+
+
+# =============================================================================
+# USER CONFIGURATION — EDIT THIS BLOCK
+# =============================================================================
+
+# Temperatures are entered manually in kelvin. The script converts every value
+# to n_th(T) = 1/expm1(hbar*OMEGA_B/(k_B*T)); the solver never receives T itself.
+TEMPERATURES_K = [
+    0.0,
+    4.0,
+    10.0,
+    20.0,
+    50.0,
+    100.0,
+    300.0,
+]
+
+# Logical CUDA ids visible inside the job. The number of simultaneously used
+# GPUs is len(CUDA_DEVICES). Examples: [0], [0, 1], [0, 1, 2, 3].
+CUDA_DEVICES = [0]
+TEMPERATURE_WORKERS = len(CUDA_DEVICES)  # one temperature queue per GPU
+
+# Physical parameters, all in SI angular-frequency units s^-1.
+GAMMA_OPT = 2.0 * math.pi * 83.0e6       # common photon decay gamma_j
+GAMMA_PHON = 2.0 * math.pi * 13.1e6      # phonon decay Gamma
+G_COUPLING = 1.11e4                      # Brillouin coupling g
+OMEGA_B = 2.0 * math.pi * 6.02e9         # acoustic angular frequency
+N_PHOTON_MODES = 3
+
+# Pump grid. E2 is recomputed from the physical parameters above.
+N_PUMP_POINTS = 50
+E_MIN_OVER_E2 = 0.0
+E_MAX_OVER_E2 = 10.0
+
+# Stochastic sampling and time integration.
+N_PATHS = 100
+DT = 1.0e-9
+BURN_TAU = 200.0
+RECORD_TAU = 1000.0
+SAMPLES_PER_TAU = 10.0
+RANDOM_SEED = 0
+RK_SUBSTEPS = 4
+
+# CUDA memory and g1 estimator.
+GPU_MEMORY_FRACTION = 0.35
+PUMP_CHUNK = 0                           # 0 = select automatically
+G1_LAGS = 64
+G1_ORIGINS = 256
+
+# =============================================================================
+# END USER CONFIGURATION
+# =============================================================================
 
 
 def build_cuda() -> None:
@@ -53,34 +105,21 @@ def has_option(argv: list[str], name: str) -> bool:
     return any(arg == name or arg.startswith(name + "=") for arg in argv)
 
 
-def visible_device_ids() -> list[int]:
-    """Return logical CUDA ids exposed to this process by a cluster scheduler."""
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
-    if not visible:
-        return [0]
-    if visible in {"-1", "NoDevFiles"}:
-        return []
-    tokens = [x.strip() for x in visible.split(",") if x.strip()]
-    # CUDA renumbers visible physical ids/UUIDs densely inside the process.
-    return list(range(len(tokens))) or [0]
-
-
 def main() -> None:
     cuda_parser = argparse.ArgumentParser(add_help=False)
     cuda_parser.add_argument("--cuda-device", type=int, default=None,
                              help="single-device compatibility alias")
     cuda_parser.add_argument("--cuda-devices", default=None,
-                             help="comma-separated logical CUDA ids; default: all "
-                                  "devices exposed through CUDA_VISIBLE_DEVICES")
-    cuda_parser.add_argument("--temperature-workers", type=int, default=0,
-                             help="parallel temperatures; 0 = one worker per selected GPU")
-    cuda_parser.add_argument("--g1-lags", type=int, default=64)
-    cuda_parser.add_argument("--g1-origins", type=int, default=256)
-    cuda_parser.add_argument("--pump-chunk", type=int, default=0,
+                             help="override CUDA_DEVICES from this file")
+    cuda_parser.add_argument("--temperature-workers", type=int, default=None,
+                             help="override TEMPERATURE_WORKERS from this file")
+    cuda_parser.add_argument("--g1-lags", type=int, default=G1_LAGS)
+    cuda_parser.add_argument("--g1-origins", type=int, default=G1_ORIGINS)
+    cuda_parser.add_argument("--pump-chunk", type=int, default=PUMP_CHUNK,
                              help="pump points resident on GPU at once; 0 = automatic")
-    cuda_parser.add_argument("--rk-substeps", type=int, default=4,
+    cuda_parser.add_argument("--rk-substeps", type=int, default=RK_SUBSTEPS,
                              help="RK4/noise substeps inside each recorded dt (default 4)")
-    cuda_parser.add_argument("--gpu-memory-fraction", type=float, default=0.35,
+    cuda_parser.add_argument("--gpu-memory-fraction", type=float, default=GPU_MEMORY_FRACTION,
                              help="fraction of currently free memory available to a worker")
     cuda_parser.add_argument("--no-build-cuda", action="store_true")
     cuda_args, sweep_argv = cuda_parser.parse_known_args()
@@ -95,10 +134,11 @@ def main() -> None:
         except ValueError:
             cuda_parser.error("--cuda-devices must be a comma-separated list of integers")
     else:
-        devices = visible_device_ids()
+        devices = list(CUDA_DEVICES)
     if not devices or any(d < 0 for d in devices) or len(set(devices)) != len(devices):
         cuda_parser.error("CUDA device ids must be distinct non-negative integers")
-    temperature_workers = cuda_args.temperature_workers or len(devices)
+    temperature_workers = (TEMPERATURE_WORKERS if cuda_args.temperature_workers is None
+                           else cuda_args.temperature_workers)
     if temperature_workers < 1 or temperature_workers > len(devices):
         cuda_parser.error("--temperature-workers must be between 1 and the number of devices")
     if not 0.0 < cuda_args.gpu_memory_fraction <= 0.8:
@@ -123,7 +163,26 @@ def main() -> None:
             raise FileNotFoundError(f"{CUDA_EXE} does not exist and --no-build-cuda was set")
         build_cuda()
 
+    E2 = GAMMA_OPT ** 1.5 * math.sqrt(GAMMA_PHON) / (2.0 * G_COUPLING)
     defaults = ["--exe", str(CUDA_EXE), "--no-make"]
+
+    def add_default(option: str, value: object) -> None:
+        if not has_option(sweep_argv, option):
+            defaults.extend([option, str(value)])
+
+    add_default("--gamma-opt", GAMMA_OPT)
+    add_default("--Gamma", GAMMA_PHON)
+    add_default("--g", G_COUPLING)
+    add_default("--N-photons", N_PHOTON_MODES)
+    add_default("--n-paths", N_PATHS)
+    add_default("--nE", N_PUMP_POINTS)
+    add_default("--E-min", E_MIN_OVER_E2 * E2)
+    add_default("--E-max", E_MAX_OVER_E2 * E2)
+    add_default("--dt", DT)
+    add_default("--burn-tau", BURN_TAU)
+    add_default("--record-tau", RECORD_TAU)
+    add_default("--samples-per-tau", SAMPLES_PER_TAU)
+    add_default("--seed", RANDOM_SEED)
     if not has_option(sweep_argv, "--temperature-workers"):
         defaults += ["--temperature-workers", str(temperature_workers)]
     if not has_option(sweep_argv, "--worker-devices"):
@@ -139,6 +198,11 @@ def main() -> None:
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import nth_sweep
+
+    # Make this file the single source of truth for the CUDA run.
+    nth_sweep.TEMPERATURES_K = [float(T) for T in TEMPERATURES_K]
+    nth_sweep.OMEGA_B = OMEGA_B
+    nth_sweep.THETA_B = nth_sweep.HBAR * OMEGA_B / nth_sweep.K_B
 
     old_argv = sys.argv
     sys.argv = [old_argv[0], *defaults, *sweep_argv]
@@ -157,6 +221,7 @@ def main() -> None:
     with out_path.open(encoding="utf-8") as f:
         result = json.load(f)
     result.setdefault("meta", {})["backend"] = "cuda_cpp"
+    result["meta"]["thermal_control"] = "TEMPERATURES_K in scripts/nth_sweep_cuda.py"
     result["meta"]["cuda_devices"] = devices
     result["meta"]["temperature_workers"] = temperature_workers
     result["meta"]["g1_lags"] = cuda_args.g1_lags
