@@ -79,13 +79,9 @@ N_PHOTONS = 3
 # T = 0 K is allowed and is treated exactly as n_th = 0.
 # The order is preserved; duplicates are rejected in main().
 TEMPERATURES_K = [
-    0.0,
-    4.0,
     10.0,
-    20.0,
-    50.0,
-    100.0,
     300.0,
+    3000.0
 ]
 
 
@@ -110,7 +106,7 @@ def nth_from_temperature(T_K: float) -> float:
 # main() below, where the same expression is printed for the actually-used
 # --g/--Gamma/--gamma-opt). Used only to size the --E-max default at 10*E2.
 _E2_DEFAULT = GAMMA_OPT ** 1.5 * math.sqrt(GAMMA_PHON) / (2.0 * G_COUPLING)
-E_MAX_DEFAULT = 10.0 * _E2_DEFAULT
+E_MAX_DEFAULT = 5.0 * _E2_DEFAULT
 
 
 def parse_args() -> argparse.Namespace:
@@ -120,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     # pump grid
     ap.add_argument("--E-min", type=float, default=0.0)
     ap.add_argument("--E-max", type=float, default=E_MAX_DEFAULT)
-    ap.add_argument("--nE", type=int, default=50)
+    ap.add_argument("--nE", type=int, default=20)
     # physics
     ap.add_argument("--g", type=float, default=G_COUPLING)
     ap.add_argument("--Gamma", type=float, default=GAMMA_PHON)
@@ -129,7 +125,7 @@ def parse_args() -> argparse.Namespace:
     # integration
     ap.add_argument("--scheme", default="splitting", choices=["splitting", "taylor15", "euler"])
     ap.add_argument("--noise", default="gauss", choices=["gauss", "telegraph"])
-    ap.add_argument("--dt", type=float, default=1.0e-9,
+    ap.add_argument("--dt", type=float, default=1.0e-8,
                     help="integration step in seconds (default 1 ns)")
     ap.add_argument("--n-paths", type=int, default=100)
     ap.add_argument("--thin", type=int, default=None,
