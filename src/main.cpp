@@ -57,7 +57,7 @@ struct Options {
 
 [[noreturn]] void usage(int code) {
   std::cout <<
-      R"(sde_solver — Brillouin cascade (two-phonon model) nonlinear SDE solver.
+      R"(sde_solver — Brillouin cascade nonlinear SDE solver.
 
 Options:
   --E-min <f>        lowest pump value                 (default 0)
@@ -80,7 +80,7 @@ Options:
                      weak order 1.0 only — pair it with --scheme euler
   --threads <int>    OpenMP threads (0 = default)
   --g <f>            coupling: alpha = beta = g        (default 1e-2)
-  --Gamma <f>        phonon decay Gamma_1 = Gamma_2    (default 1e-2)
+  --Gamma <f>        common decay of every phonon mode (default 1e-2)
   --gamma-opt <f>    photon decay gamma_j (all modes)  (default 1e-1)
   --nth <f>          thermal phonon occupancy: <|b_k|^2> = nth exactly,
                      i.e. D0 = Gamma*nth/2           (default: legacy D0)
@@ -191,6 +191,10 @@ Options parse(int argc, char** argv) {
     std::cerr << "error: --N-photons must be in [1, " << MAX_ORDER << "]\n";
     std::exit(2);
   }
+  if (USE_PAIRWISE_PHONONS && o.N_photons < 2) {
+    std::cerr << "error: pairwise-phonon model requires --N-photons >= 2\n";
+    std::exit(2);
+  }
   if (o.spec_points < 2) { std::cerr << "error: --spec-points must be >= 2\n"; std::exit(2); }
   if (!(o.cfg.dt > 0)) { std::cerr << "error: --dt must be > 0\n"; std::exit(2); }
   if (o.cfg.n_steps <= o.cfg.burn) { std::cerr << "error: --n-steps must exceed --burn\n"; std::exit(2); }
@@ -283,14 +287,15 @@ int main(int argc, char** argv) {
   Params p;
   p.init_defaults(o.N_photons);   // set active photon count + default gammas/D0
   const int OO = p.order;         // active number of photon modes
+  const int NB = p.n_phon();      // 2 shared phonons or N-1 pairwise phonons
   if (o.g > 0) { p.alpha = o.g; p.beta = o.g; }
   if (o.gamma_opt > 0)
     for (int k = 0; k < OO; ++k) p.gammas[k] = cdouble(o.gamma_opt, p.gammas[k].imag());
   if (o.Gamma > 0)
-    for (int k = 0; k < N_PHON; ++k)
+    for (int k = 0; k < NB; ++k)
       p.gammas[p.phon_index(k)] = cdouble(o.Gamma, p.gammas[p.phon_index(k)].imag());
   if (o.nth >= 0) {  // >=: --nth 0 (zero temperature, D0 = 0) is legitimate
-    for (int k = 0; k < N_PHON; ++k)
+    for (int k = 0; k < NB; ++k)
       // Per-quadrature OU: d(Re b) = -(Gamma/2) Re b dt + sqrt(D0) dW, hence
       // Var(Re b) = D0/Gamma and <|b|^2> = 2*D0/Gamma. Setting <|b|^2> = nth
       // gives D0 = Gamma*nth/2. (The old mapping D0 = 2*Gamma*nth produced
@@ -301,9 +306,10 @@ int main(int argc, char** argv) {
   }
 
   // The Lyapunov linear reference (linear_theory.hpp) is hard-wired to N=3.
-  const bool have_linear = (OO == ORDER);
+  const bool have_linear = !USE_PAIRWISE_PHONONS && (OO == ORDER);
   if (o.linear_only && !have_linear) {
-    std::cerr << "error: --linear-only requires --N-photons 3 (linear theory is N=3 only)\n";
+    std::cerr << "error: --linear-only is available only for the shared-two "
+                 "model with --N-photons 3\n";
     return 2;
   }
 
@@ -364,9 +370,9 @@ int main(int argc, char** argv) {
     if (trace && !st.converged)
       std::cerr << "      warning: steady state not converged (residual "
                 << st.residual << ", " << st.n_steps << " RK45 steps)" << std::endl;
-    std::vector<double> A(OO, 0.0), B(N_PHON, 0.0);
+    std::vector<double> A(OO, 0.0), B(NB, 0.0);
     for (int k = 0; k < OO; ++k) A[k] = std::abs(cvar(st.x, p.nvar(), k));
-    for (int k = 0; k < N_PHON; ++k)
+    for (int k = 0; k < NB; ++k)
       B[k] = std::abs(cvar(st.x, p.nvar(), p.phon_index(k)));
 
     // 2) linear (Lyapunov) reference — only defined for N=3.
@@ -374,10 +380,11 @@ int main(int argc, char** argv) {
     if (have_linear) {
       Vec3 A3{A[0], A[1], A[2]};
       Vec2 B2{B[0], B[1]};
-      const Vec3 lw = lw_linear(A3, B2, p.D0);
+      const std::array<double, 2> D02{p.D0[0], p.D0[1]};
+      const Vec3 lw = lw_linear(A3, B2, D02);
       const Vec3 gam{p.gammas[0].real(), p.gammas[1].real(), p.gammas[2].real()};
       const Vec2 Gam{p.gammas[3].real(), p.gammas[4].real()};
-      Vec3 g2l = g2_linear_minus_one(A3, B2, gam, Gam, p.alpha, p.beta, p.D0);
+      Vec3 g2l = g2_linear_minus_one(A3, B2, gam, Gam, p.alpha, p.beta, D02);
       for (int k = 0; k < ORDER; ++k) { lw_li[k] = lw[k]; g2_li[k] = g2l[k] + 1.0; }
     }
 
@@ -385,8 +392,8 @@ int main(int argc, char** argv) {
     std::vector<double> fwhm_msd(OO, std::nan("")), fwhm_g1(OO, std::nan("")),
         r2_msd(OO, std::nan("")), r2_g1(OO, std::nan("")),
         g2_0(OO, std::nan("")), A_mean(OO, std::nan("")),
-        B_mean(N_PHON, std::nan("")),
-        g2_0_phon(N_PHON, std::nan(""));   // NEW: g2(0) of the phonon modes
+        B_mean(NB, std::nan("")),
+        g2_0_phon(NB, std::nan(""));
     long n_div = 0;
     long n_keep = 0;
 
@@ -416,7 +423,7 @@ int main(int argc, char** argv) {
         g2_0[j] = g2_zero(P, j);
         A_mean[j] = mean_abs(P, j);
       }
-      for (int k = 0; k < N_PHON; ++k) {
+      for (int k = 0; k < NB; ++k) {
         B_mean[k] = mean_abs(P, p.phon_index(k));
         g2_0_phon[k] = g2_zero(P, p.phon_index(k));  // phonon intensity g2(0)
       }
@@ -514,6 +521,7 @@ int main(int argc, char** argv) {
     << "  \"seed\": " << o.cfg.seed << ",\n"
     << "  \"linear_only\": " << (o.linear_only ? "true" : "false") << ",\n"
     << "  \"has_linear\": " << (have_linear ? "true" : "false") << ",\n"
+    << "  \"phonon_layout\": \"" << (USE_PAIRWISE_PHONONS ? "pairwise" : "shared_two") << "\",\n"
     << "  \"spectrum\": " << (o.spectrum ? "true" : "false") << ",\n"
     << "  \"total_walltime\": " << jnum(total) << "\n"
     << " },\n"
@@ -523,10 +531,11 @@ int main(int argc, char** argv) {
     << "  \"BETA\": " << jnum(p.beta) << ",\n"
     << "  \"OMEGA\": " << jnum(p.omega_shift) << ",\n"
     << "  \"ORDER\": " << OO << ",\n"
-    << "  \"N_PHON\": " << N_PHON << ",\n"
+    << "  \"N_PHON\": " << NB << ",\n"
     << "  \"GAMMAS_RE\": [";
   for (int i = 0; i < p.nvar(); ++i) f << (i ? ", " : "") << jnum(p.gammas[i].real());
-  f << "],\n  \"D0_PHONON\": " << jarr(p.D0) << ",\n"
+  std::vector<double> D0_active(p.D0.begin(), p.D0.begin() + NB);
+  f << "],\n  \"D0_PHONON\": " << jarr(D0_active) << ",\n"
     << "  \"NTH\": " << jnum(o.nth) << "\n }\n}\n";
   f.close();
   if (!f) {
