@@ -10,6 +10,7 @@ for %%I in ("%SCRIPT_DIR%..") do set "PROJECT_ROOT=%%~fI"
 set "CUDA_SOURCE=%PROJECT_ROOT%\cuda\sde_solver_cuda.cu"
 set "BUILD_DIR=%PROJECT_ROOT%\build_cuda"
 set "CUDA_EXE=%BUILD_DIR%\sde_solver_cuda.exe"
+set "PAIRWISE_CUDA_EXE=%BUILD_DIR%\sde_solver_pairwise_cuda.exe"
 
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 
@@ -40,7 +41,17 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo "%NVCC%" %NVCCFLAGS% -DPAIRWISE_PHONONS=1 -o "%PAIRWISE_CUDA_EXE%" "%CUDA_SOURCE%"
+"%NVCC%" %NVCCFLAGS% -DPAIRWISE_PHONONS=1 -o "%PAIRWISE_CUDA_EXE%" "%CUDA_SOURCE%"
+
+if errorlevel 1 (
+    echo.
+    echo PAIRWISE BUILD FAILED.
+    exit /b 1
+)
+
 echo.
 echo OK -^> "%CUDA_EXE%"
+echo OK -^> "%PAIRWISE_CUDA_EXE%"
 endlocal
 exit /b 0
