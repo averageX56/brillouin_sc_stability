@@ -124,7 +124,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--N-photons", type=int, default=N_PHOTONS)
     ap.add_argument("--N-phonons", type=int, default=2,
                     help="expected phonon count in solver output (default 2); "
-                         "pairwise CUDA uses N-photons-1")
+                         "pairwise solvers use N-photons-1")
+    ap.add_argument("--phonon-layout", choices=["shared_two", "pairwise"],
+                    default="shared_two",
+                    help="topology label used for cache isolation and output validation")
     # integration
     ap.add_argument("--scheme", default="splitting", choices=["splitting", "taylor15", "euler"])
     ap.add_argument("--noise", default="gauss", choices=["gauss", "telegraph"])
@@ -524,7 +527,8 @@ def param_fingerprint(args, n_steps: int, burn: int) -> str:
     entries simply miss the cache instead of corrupting the result.
     """
     keys = (args.dt, n_steps, burn, args.thin, args.n_paths, args.seed,
-            args.nE, args.E_min, args.E_max, args.N_photons, args.N_phonons, args.scheme,
+            args.nE, args.E_min, args.E_max, args.N_photons, args.N_phonons,
+            args.phonon_layout, args.scheme,
             args.noise, args.g, args.Gamma, args.gamma_opt, OMEGA_B, HBAR, K_B, tuple(TEMPERATURES_K))
     blob = "|".join(repr(k) for k in keys)
     return hashlib.sha1(blob.encode()).hexdigest()[:8]
@@ -770,6 +774,11 @@ def main() -> None:
             log.close()
             sys.exit(f"error: solver returned N_PHON={n_b}, expected {args.N_phonons}; "
                      "check that the selected executable matches the sweep pipeline")
+        returned_layout = data.get("meta", {}).get("phonon_layout")
+        if returned_layout is not None and returned_layout != args.phonon_layout:
+            log.close()
+            sys.exit(f"error: solver returned phonon_layout={returned_layout!r}, "
+                     f"expected {args.phonon_layout!r}; check the selected executable")
 
         def col(key, j):
             return [None if r[key][j] is None else float(r[key][j]) for r in R]
@@ -835,6 +844,7 @@ def main() -> None:
             "frequency_units": "s^-1 (angular decay rates gamma, Gamma; article g used directly)",
             "N_photons": args.N_photons,
             "N_phonons": args.N_phonons,
+            "phonon_layout": args.phonon_layout,
             "scheme": args.scheme, "noise": args.noise,
             "dt": args.dt, "n_steps": n_steps, "burn": burn,
             "thin": args.thin, "n_paths": args.n_paths, "seed": args.seed,
