@@ -122,6 +122,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--Gamma", type=float, default=GAMMA_PHON)
     ap.add_argument("--gamma-opt", type=float, default=GAMMA_OPT)
     ap.add_argument("--N-photons", type=int, default=N_PHOTONS)
+    ap.add_argument("--N-phonons", type=int, default=2,
+                    help="expected phonon count in solver output (default 2); "
+                         "pairwise solvers use N-photons-1")
+    ap.add_argument("--phonon-layout", choices=["shared_two", "pairwise"],
+                    default="shared_two",
+                    help="topology label used for cache isolation and output validation")
     # integration
     ap.add_argument("--scheme", default="splitting", choices=["splitting", "taylor15", "euler"])
     ap.add_argument("--noise", default="gauss", choices=["gauss", "telegraph"])
@@ -521,7 +527,8 @@ def param_fingerprint(args, n_steps: int, burn: int) -> str:
     entries simply miss the cache instead of corrupting the result.
     """
     keys = (args.dt, n_steps, burn, args.thin, args.n_paths, args.seed,
-            args.nE, args.E_min, args.E_max, args.N_photons, args.scheme,
+            args.nE, args.E_min, args.E_max, args.N_photons, args.N_phonons,
+            args.phonon_layout, args.scheme,
             args.noise, args.g, args.Gamma, args.gamma_opt, OMEGA_B, HBAR, K_B, tuple(TEMPERATURES_K))
     blob = "|".join(repr(k) for k in keys)
     return hashlib.sha1(blob.encode()).hexdigest()[:8]
@@ -611,8 +618,10 @@ def main() -> None:
 
     if args.g <= 0.0 or args.Gamma <= 0.0 or args.gamma_opt <= 0.0:
         sys.exit("error: g, Gamma, and gamma-opt must all be positive")
-    if args.dt <= 0.0 or args.nE < 2 or args.n_paths < 1 or args.N_photons < 2:
-        sys.exit("error: require dt > 0, nE >= 2, n-paths >= 1, and N-photons >= 2")
+    if (args.dt <= 0.0 or args.nE < 2 or args.n_paths < 1
+            or args.N_photons < 2 or args.N_phonons < 1):
+        sys.exit("error: require dt > 0, nE >= 2, n-paths >= 1, "
+                 "N-photons >= 2, and N-phonons >= 1")
     if args.E_min < 0.0 or args.E_max <= args.E_min:
         sys.exit("error: require 0 <= E-min < E-max")
     if args.burn_tau < 0.0 or args.record_tau <= 0.0 or args.samples_per_tau <= 0.0:
@@ -650,13 +659,14 @@ def main() -> None:
           f"(1/Gamma = {tau:.4g} s), g = {args.g:g} s^-1")
     print(f"Otterstrom reference Omega_b = {OMEGA_B:g} s^-1 "
           f"(Omega_b/2pi = {OMEGA_B / (2.0 * math.pi):g} Hz); rotating-frame solver")
+    print(f"modes: {args.N_photons} photons, {args.N_phonons} phonons")
     print(f"scheme = {args.scheme}, noise = {args.noise}, dt = {args.dt:g} s")
     print(f"steps: burn = {burn} (t = {burn * args.dt:g} = {burn * args.dt / tau:.1f}/Gamma), "
           f"total = {n_steps} (record t = {(n_steps - burn) * args.dt:g} = "
           f"{(n_steps - burn) * args.dt / tau:.1f}/Gamma)")
     n_keep = (n_steps - burn) // args.thin
     spt = tau / (args.thin * args.dt)
-    mem_mb = n_keep * args.n_paths * (args.N_photons + 2) * 16 / 2**20
+    mem_mb = n_keep * args.n_paths * (args.N_photons + args.N_phonons) * 16 / 2**20
     print(f"thin = {args.thin} -> n_keep = {n_keep} samples/path "
           f"({spt:.1f} per correlation time, {n_keep * args.dt * args.thin / tau:.0f} "
           f"independent), trajectory buffer {mem_mb:.0f} MB per pump point")
@@ -759,6 +769,16 @@ def main() -> None:
             log.close()
             sys.exit(f"error: no result produced for T = {T_K:g} K")
         R = data["results"]
+        n_b = int(data.get("params", {}).get("N_PHON", args.N_phonons))
+        if n_b != args.N_phonons:
+            log.close()
+            sys.exit(f"error: solver returned N_PHON={n_b}, expected {args.N_phonons}; "
+                     "check that the selected executable matches the sweep pipeline")
+        returned_layout = data.get("meta", {}).get("phonon_layout")
+        if returned_layout is not None and returned_layout != args.phonon_layout:
+            log.close()
+            sys.exit(f"error: solver returned phonon_layout={returned_layout!r}, "
+                     f"expected {args.phonon_layout!r}; check the selected executable")
 
         def col(key, j):
             return [None if r[key][j] is None else float(r[key][j]) for r in R]
@@ -771,12 +791,12 @@ def main() -> None:
             # generation curves: deterministic and SDE-averaged amplitudes
             "A_det": [col("A_det", j) for j in range(n_ph)],
             "A_mean": [col("A_mean", j) for j in range(n_ph)],
-            "B_det": [col("B_det", k) for k in range(2)],
-            "B_mean": [col("B_mean", k) for k in range(2)],
+            "B_det": [col("B_det", k) for k in range(n_b)],
+            "B_mean": [col("B_mean", k) for k in range(n_b)],
             # g2 at EVERY pump point
             "g2_0": [col("g2_0", j) for j in range(n_ph)],
             "g2_lin": [col("g2_lin", j) for j in range(n_ph)],
-            "g2_0_phonon": [col("g2_0_phonon", k) for k in range(2)],
+            "g2_0_phonon": [col("g2_0_phonon", k) for k in range(n_b)],
             "fwhm_g1": [col("fwhm_g1", j) for j in range(n_ph)],
             "fwhm_msd": [col("fwhm_msd", j) for j in range(n_ph)],
             "n_diverged": [int(r["n_diverged"]) for r in R],
@@ -801,9 +821,10 @@ def main() -> None:
                          if finite else "all NaN"))
         n_sub = len(finite) - len(phys)
         ph = entries[-1]["g2_0_phonon"]
-        ph_fin = [v for v in ph[1] if v is not None and math.isfinite(v)]
+        summary_b = min(1, n_b - 1)
+        ph_fin = [v for v in ph[summary_b] if v is not None and math.isfinite(v)]
         ph_txt = f"{sum(ph_fin) / len(ph_fin):.4f}" if ph_fin else "NaN"
-        log(f"    g2_a2 range = {rng_txt}   <g2_b2> = {ph_txt}   diverged = {div}"
+        log(f"    g2_a2 range = {rng_txt}   <g2_b{summary_b + 1}> = {ph_txt}   diverged = {div}"
             f"{f'   sub-threshold pts skipped: {n_sub}' if n_sub else ''}")
 
     result = {
@@ -822,6 +843,8 @@ def main() -> None:
             "temperature_to_nth": "n_th = 1 / expm1(hbar*Omega_b/(k_B*T)); n_th(0 K)=0",
             "frequency_units": "s^-1 (angular decay rates gamma, Gamma; article g used directly)",
             "N_photons": args.N_photons,
+            "N_phonons": args.N_phonons,
+            "phonon_layout": args.phonon_layout,
             "scheme": args.scheme, "noise": args.noise,
             "dt": args.dt, "n_steps": n_steps, "burn": burn,
             "thin": args.thin, "n_paths": args.n_paths, "seed": args.seed,

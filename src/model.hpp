@@ -1,9 +1,9 @@
 // model.hpp — Brillouin cascade: parameters, state layout, deterministic drift.
 //
-// The number of photon modes (ORDER) is now a RUNTIME parameter (Params::order),
-// generalising the equations of motion of Cascade_Brillouin_scattering.tex,
-// eq. (124)-(168), to any N. The number of phonon modes stays 2 (the paper's
-// two-phonon model: b1 drives odd->even transitions, b2 drives even->odd).
+// The number of photon modes (ORDER) is a RUNTIME parameter (Params::order).
+// The default build keeps the paper's two shared phonons. A second build with
+// PAIRWISE_PHONONS=1 creates N-1 independent phonons, one for every adjacent
+// photon pair (a_j, a_{j+1}).
 //
 // To keep the hot loops allocation-free, the real state vector has a fixed
 // CAPACITY (MAX_DIM) but only the first `p.dim()` entries are active. At the
@@ -29,14 +29,21 @@ using cdouble = std::complex<double>;
 // constants so existing call sites and the N=3 notebook keep working); the
 // active sizes come from Params at run time.
 inline constexpr int ORDER = 3;              // default photon modes a1..a3
-inline constexpr int N_PHON = 2;             // phonon modes b1..b2 (fixed by the model)
+#ifdef PAIRWISE_PHONONS
+inline constexpr bool USE_PAIRWISE_PHONONS = true;
+#else
+inline constexpr bool USE_PAIRWISE_PHONONS = false;
+#endif
+inline constexpr int N_PHON = 2;             // legacy/default count for N=3
 inline constexpr int NVAR = ORDER + N_PHON;  // default 5 complex variables
 inline constexpr int DIM = 2 * NVAR;         // default 10 real variables
 inline constexpr int M_NOISE = 2 * N_PHON;   // 4 independent Wiener processes
 
 // Runtime capacity: supports up to MAX_ORDER photon modes without heap use.
 inline constexpr int MAX_ORDER = 64;
-inline constexpr int MAX_NVAR = MAX_ORDER + N_PHON;
+inline constexpr int MAX_PHONONS = USE_PAIRWISE_PHONONS ? MAX_ORDER - 1 : N_PHON;
+inline constexpr int MAX_M_NOISE = 2 * MAX_PHONONS;
+inline constexpr int MAX_NVAR = MAX_ORDER + MAX_PHONONS;
 inline constexpr int MAX_DIM = 2 * MAX_NVAR;
 
 // Fixed-capacity real state. Only the first `dim` entries are meaningful, but
@@ -53,17 +60,17 @@ struct Params {
   double omega_shift = 8e-5 * 1e5;  // OMEGA (detuning correction scale)
 
   // Photon decay rates gamma_j (complex; Im part feeds the detuning correction)
-  // followed by the two phonon decay rates Gamma_1, Gamma_2 at indices
-  // [order], [order+1]. Sized to the capacity; only the active head is used.
+  // followed by the active phonon decay rates at indices [order, nvar).
   std::array<cdouble, MAX_NVAR> gammas{};
 
-  std::array<double, N_PHON> D0{};  // phonon diffusion intensities
+  std::array<double, MAX_PHONONS> D0{};  // active head: phonon diffusion intensities
 
   Params() { init_defaults(order); }
 
-  int nvar() const { return order + N_PHON; }
+  int n_phon() const { return USE_PAIRWISE_PHONONS ? order - 1 : N_PHON; }
+  int nvar() const { return order + n_phon(); }
   int dim() const { return 2 * nvar(); }
-  int m_noise() const { return 2 * N_PHON; }
+  int m_noise() const { return 2 * n_phon(); }
 
   // Index of phonon k (0-based) inside the complex vector y.
   int phon_index(int k) const { return order + k; }
@@ -82,8 +89,8 @@ struct Params {
         gammas[k] = cdouble(base_val * std::pow(1.1, k), 0.0);
     }
     
-    // Второй цикл: поправка +10% отсчитывается заново от 0 до N_PHON
-    for (int k = 0; k < N_PHON; ++k) {
+    // Phonon decay rates; the +10% sequence restarts at the first phonon.
+    for (int k = 0; k < n_phon(); ++k) {
         double base_val = 1e-7 * 1e5;
         gammas[order + k] = cdouble(base_val * std::pow(1.1, k), 0.0);
     }
@@ -92,12 +99,12 @@ struct Params {
 }
 
 
-  // D0_PHONON = ones(2) * Re(Gamma) * 1e-3 * OMEGA_0 / OMEGA * 3 * 2   (legacy).
+  // Legacy default diffusion, applied independently to every active phonon.
   void set_default_D0() {
     const double v =
         gammas[phon_index(0)].real() * 1e-3 * omega_0 / omega_shift * 3.0 * 2;
-    D0[0] = v;
-    D0[1] = v;
+    D0.fill(0.0);
+    for (int k = 0; k < n_phon(); ++k) D0[k] = v;
   }
 
   // Detuning correction on rho_1: (2*Omega*g0i + g0i^2) / (2*(Omega + g0i)).
@@ -135,39 +142,54 @@ inline State drift(const State& x, double E, const Params& p) {
   const int O = p.order;
   const int nv = p.nvar();
   const auto& g = p.gammas;
-  const int i_b1 = p.phon_index(0), i_b2 = p.phon_index(1);
-  const cdouble r1 = cvar(x, nv, i_b1), r2 = cvar(x, nv, i_b2);
-
   State d{};  // zero-initialised (unused tail stays 0)
 
-  for (int k = 0; k < O; ++k) {
-    const int j = k + 1;  // 1-based paper index
-    cdouble acc(0.0, 0.0);
-    if (j == 1) {
-      if (O >= 2) acc += I * p.alpha * r1 * cvar(x, nv, 1);
-      acc += -I * E;
-    } else if (j % 2 == 0) {  // even j: forward Stokes fed by b2, drained to b1
-      if (k + 1 < O) acc += I * p.alpha * r2 * cvar(x, nv, k + 1);
-      acc += I * p.alpha * std::conj(r1) * cvar(x, nv, k - 1);
-    } else {  // odd j > 1
-      acc += I * p.alpha * std::conj(r2) * cvar(x, nv, k - 1);
-      if (k + 1 < O) acc += I * p.alpha * r1 * cvar(x, nv, k + 1);
+  if constexpr (USE_PAIRWISE_PHONONS) {
+    for (int k = 0; k < O; ++k) {
+      cdouble acc = -g[k] * cvar(x, nv, k) / 2.0;
+      if (k + 1 < O)
+        acc += I * p.alpha * cvar(x, nv, p.phon_index(k)) * cvar(x, nv, k + 1);
+      if (k > 0)
+        acc += I * p.alpha * std::conj(cvar(x, nv, p.phon_index(k - 1)))
+               * cvar(x, nv, k - 1);
+      if (k == 0) acc += -I * E;
+      set_cvar(d, nv, k, acc);
     }
-    acc += -g[k] * cvar(x, nv, k) / 2.0;
-    set_cvar(d, nv, k, acc);
+    for (int k = 0; k < p.n_phon(); ++k) {
+      const int ib = p.phon_index(k);
+      const cdouble b = cvar(x, nv, ib);
+      cdouble db = I * p.beta * cvar(x, nv, k) * std::conj(cvar(x, nv, k + 1))
+                   - g[ib] * b / 2.0;
+      if (k == 0) db += I * p.corr() * b;
+      set_cvar(d, nv, ib, db);
+    }
+  } else {
+    const int i_b1 = p.phon_index(0), i_b2 = p.phon_index(1);
+    const cdouble r1 = cvar(x, nv, i_b1), r2 = cvar(x, nv, i_b2);
+    for (int k = 0; k < O; ++k) {
+      const int j = k + 1;
+      cdouble acc(0.0, 0.0);
+      if (j == 1) {
+        if (O >= 2) acc += I * p.alpha * r1 * cvar(x, nv, 1);
+        acc += -I * E;
+      } else if (j % 2 == 0) {
+        if (k + 1 < O) acc += I * p.alpha * r2 * cvar(x, nv, k + 1);
+        acc += I * p.alpha * std::conj(r1) * cvar(x, nv, k - 1);
+      } else {
+        acc += I * p.alpha * std::conj(r2) * cvar(x, nv, k - 1);
+        if (k + 1 < O) acc += I * p.alpha * r1 * cvar(x, nv, k + 1);
+      }
+      acc += -g[k] * cvar(x, nv, k) / 2.0;
+      set_cvar(d, nv, k, acc);
+    }
+    cdouble s1(0.0, 0.0), s2(0.0, 0.0);
+    for (int k = 0; k + 1 < O; k += 2)
+      s1 += cvar(x, nv, k) * std::conj(cvar(x, nv, k + 1));
+    for (int k = 1; k + 1 < O; k += 2)
+      s2 += cvar(x, nv, k) * std::conj(cvar(x, nv, k + 1));
+    set_cvar(d, nv, i_b1, I * p.beta * s1 - g[i_b1] * r1 / 2.0 + r1 * I * p.corr());
+    set_cvar(d, nv, i_b2, I * p.beta * s2 - g[i_b2] * r2 / 2.0);
   }
-
-  // Phonon sources. b1 over odd j (0-based even k), b2 over even j (0-based odd k).
-  cdouble s1(0.0, 0.0), s2(0.0, 0.0);
-  for (int k = 0; k + 1 < O; k += 2)
-    s1 += cvar(x, nv, k) * std::conj(cvar(x, nv, k + 1));
-  for (int k = 1; k + 1 < O; k += 2)
-    s2 += cvar(x, nv, k) * std::conj(cvar(x, nv, k + 1));
-
-  const cdouble dr1 = I * p.beta * s1 - g[i_b1] * r1 / 2.0 + r1 * I * p.corr();
-  const cdouble dr2 = I * p.beta * s2 - g[i_b2] * r2 / 2.0;
-  set_cvar(d, nv, i_b1, dr1);
-  set_cvar(d, nv, i_b2, dr2);
   return d;
 }
 
@@ -179,43 +201,57 @@ inline State drift_coupling(const State& x, const Params& p) {
   const cdouble I(0.0, 1.0);
   const int O = p.order;
   const int nv = p.nvar();
-  const int i_b1 = p.phon_index(0), i_b2 = p.phon_index(1);
-  const cdouble r1 = cvar(x, nv, i_b1), r2 = cvar(x, nv, i_b2);
-
   State d{};
-  for (int k = 0; k < O; ++k) {
-    const int j = k + 1;
-    cdouble acc(0.0, 0.0);
-    if (j == 1) {
-      if (O >= 2) acc += I * p.alpha * r1 * cvar(x, nv, 1);
-    } else if (j % 2 == 0) {
-      if (k + 1 < O) acc += I * p.alpha * r2 * cvar(x, nv, k + 1);
-      acc += I * p.alpha * std::conj(r1) * cvar(x, nv, k - 1);
-    } else {
-      acc += I * p.alpha * std::conj(r2) * cvar(x, nv, k - 1);
-      if (k + 1 < O) acc += I * p.alpha * r1 * cvar(x, nv, k + 1);
+  if constexpr (USE_PAIRWISE_PHONONS) {
+    for (int k = 0; k < O; ++k) {
+      cdouble acc(0.0, 0.0);
+      if (k + 1 < O)
+        acc += I * p.alpha * cvar(x, nv, p.phon_index(k)) * cvar(x, nv, k + 1);
+      if (k > 0)
+        acc += I * p.alpha * std::conj(cvar(x, nv, p.phon_index(k - 1)))
+               * cvar(x, nv, k - 1);
+      set_cvar(d, nv, k, acc);
     }
-    set_cvar(d, nv, k, acc);
+    for (int k = 0; k < p.n_phon(); ++k)
+      set_cvar(d, nv, p.phon_index(k),
+               I * p.beta * cvar(x, nv, k) * std::conj(cvar(x, nv, k + 1)));
+  } else {
+    const int i_b1 = p.phon_index(0), i_b2 = p.phon_index(1);
+    const cdouble r1 = cvar(x, nv, i_b1), r2 = cvar(x, nv, i_b2);
+    for (int k = 0; k < O; ++k) {
+      const int j = k + 1;
+      cdouble acc(0.0, 0.0);
+      if (j == 1) {
+        if (O >= 2) acc += I * p.alpha * r1 * cvar(x, nv, 1);
+      } else if (j % 2 == 0) {
+        if (k + 1 < O) acc += I * p.alpha * r2 * cvar(x, nv, k + 1);
+        acc += I * p.alpha * std::conj(r1) * cvar(x, nv, k - 1);
+      } else {
+        acc += I * p.alpha * std::conj(r2) * cvar(x, nv, k - 1);
+        if (k + 1 < O) acc += I * p.alpha * r1 * cvar(x, nv, k + 1);
+      }
+      set_cvar(d, nv, k, acc);
+    }
+    cdouble s1(0.0, 0.0), s2(0.0, 0.0);
+    for (int k = 0; k + 1 < O; k += 2)
+      s1 += cvar(x, nv, k) * std::conj(cvar(x, nv, k + 1));
+    for (int k = 1; k + 1 < O; k += 2)
+      s2 += cvar(x, nv, k) * std::conj(cvar(x, nv, k + 1));
+    set_cvar(d, nv, i_b1, I * p.beta * s1);
+    set_cvar(d, nv, i_b2, I * p.beta * s2);
   }
-  cdouble s1(0.0, 0.0), s2(0.0, 0.0);
-  for (int k = 0; k + 1 < O; k += 2)
-    s1 += cvar(x, nv, k) * std::conj(cvar(x, nv, k + 1));
-  for (int k = 1; k + 1 < O; k += 2)
-    s2 += cvar(x, nv, k) * std::conj(cvar(x, nv, k + 1));
-  set_cvar(d, nv, i_b1, I * p.beta * s1);
-  set_cvar(d, nv, i_b2, I * p.beta * s2);
   return d;
 }
 
 // Constant additive diffusion matrix B (dim x m_noise), columns = Wiener procs.
 // Noise enters phonons only: (Re b1, Im b1, Re b2, Im b2) with intensity sqrt(D0k).
-using NoiseCols = std::array<State, M_NOISE>;
+using NoiseCols = std::array<State, MAX_M_NOISE>;
 
 inline NoiseCols noise_columns(const Params& p) {
   const int nv = p.nvar();
   NoiseCols cols{};
   for (auto& c : cols) c.fill(0.0);
-  for (int k = 0; k < N_PHON; ++k) {
+  for (int k = 0; k < p.n_phon(); ++k) {
     const int re_idx = p.phon_index(k);        // Re b_k
     const int im_idx = nv + p.phon_index(k);   // Im b_k
     const double s = std::sqrt(p.D0[k]);

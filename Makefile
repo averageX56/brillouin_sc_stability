@@ -1,7 +1,9 @@
 # Brillouin cascade SDE solver.
 #
 #   make               optimised build with OpenMP   -> build/sde_solver[.exe]
-#   make no-omp        single-threaded (no OpenMP in the toolchain)
+#   make pairwise      N photons + N-1 independent phonons (CPU)
+#   make no-omp        shared-two model, single-threaded
+#   make pairwise-no-omp  pairwise model, single-threaded
 #   make debug         -O1 + address/UB sanitisers   -> build/sde_solver_debug[.exe]
 #   make drift_probe   test helper (drift on stdin)  -> build/drift_probe[.exe]
 #   make NATIVE=1      add -march=native (faster, not portable)
@@ -41,6 +43,7 @@ BUILDDIR := build
 DATADIR  := data
 
 TARGET   := $(BUILDDIR)/sde_solver$(EXE)
+PAIRWISE := $(BUILDDIR)/sde_solver_pairwise$(EXE)
 DEBUGBIN := $(BUILDDIR)/sde_solver_debug$(EXE)
 PROBE    := $(BUILDDIR)/drift_probe$(EXE)
 
@@ -53,8 +56,10 @@ HDR      := $(SRCDIR)/model.hpp $(SRCDIR)/rng.hpp $(SRCDIR)/solver.hpp \
 MKDIRS = $(PY) -c "import pathlib,sys;[pathlib.Path(p).mkdir(parents=True,exist_ok=True) for p in sys.argv[1:]]"
 RMTREE = $(PY) -c "import shutil,sys;[shutil.rmtree(p,ignore_errors=True) for p in sys.argv[1:]]"
 
-.PHONY: all no-omp debug clean distclean dirs
+.PHONY: all pairwise no-omp pairwise-no-omp debug clean distclean dirs
 all: $(TARGET)
+
+pairwise: $(PAIRWISE)
 
 dirs:
 	@$(MKDIRS) $(BUILDDIR) $(DATADIR)
@@ -62,8 +67,14 @@ dirs:
 $(TARGET): $(MAIN) $(HDR) | dirs
 	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -I$(SRCDIR) -o $@ $(MAIN)
 
+$(PAIRWISE): $(MAIN) $(HDR) | dirs
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -DPAIRWISE_PHONONS=1 -I$(SRCDIR) -o $@ $(MAIN)
+
 no-omp: $(MAIN) $(HDR) | dirs
 	$(CXX) $(CXXFLAGS) -I$(SRCDIR) -o $(TARGET) $(MAIN)
+
+pairwise-no-omp: $(MAIN) $(HDR) | dirs
+	$(CXX) $(CXXFLAGS) -DPAIRWISE_PHONONS=1 -I$(SRCDIR) -o $(PAIRWISE) $(MAIN)
 
 debug: $(MAIN) $(HDR) | dirs
 	$(CXX) -O1 -g -std=c++17 -Wall -Wextra -fsanitize=address,undefined \

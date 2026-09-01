@@ -19,6 +19,14 @@ if errorlevel 1 (
   exit /b 1
 )
 
+echo g++ %CXXFLAGS% %OMPFLAGS% -DPAIRWISE_PHONONS=1 -o build\sde_solver_pairwise.exe src\main.cpp
+g++ %CXXFLAGS% %OMPFLAGS% -DPAIRWISE_PHONONS=1 -o build\sde_solver_pairwise.exe src\main.cpp
+if errorlevel 1 (
+  echo.
+  echo PAIRWISE BUILD FAILED. If the error mentions -fopenmp, retry: build.bat no-omp
+  exit /b 1
+)
+
 if /i "%~1"=="probe" (
   echo g++ %CXXFLAGS% -o build\drift_probe.exe src\drift_probe.cpp
   g++ %CXXFLAGS% -o build\drift_probe.exe src\drift_probe.cpp
@@ -26,5 +34,6 @@ if /i "%~1"=="probe" (
 
 echo.
 echo OK -^> build\sde_solver.exe
+echo OK -^> build\sde_solver_pairwise.exe
 echo Test it:  build\sde_solver.exe --help
 endlocal
