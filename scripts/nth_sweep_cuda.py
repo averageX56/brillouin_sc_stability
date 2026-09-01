@@ -21,6 +21,8 @@ ROOT = Path(__file__).resolve().parent.parent
 CUDA_SOURCE = ROOT / "cuda"
 CUDA_BUILD = ROOT / "build_cuda"
 CUDA_EXE = CUDA_BUILD / ("sde_solver_cuda.exe" if os.name == "nt" else "sde_solver_cuda")
+PIPELINE_NAME = "nth_sweep_cuda"
+PHONON_LAYOUT = "shared_two"
 
 
 # =============================================================================
@@ -105,6 +107,17 @@ def has_option(argv: list[str], name: str) -> bool:
     return any(arg == name or arg.startswith(name + "=") for arg in argv)
 
 
+def option_value(argv: list[str], name: str) -> str | None:
+    """Return the last CLI value from either --name VALUE or --name=VALUE."""
+    value = None
+    for i, arg in enumerate(argv):
+        if arg.startswith(name + "="):
+            value = arg.split("=", 1)[1]
+        elif arg == name and i + 1 < len(argv):
+            value = argv[i + 1]
+    return value
+
+
 def main() -> None:
     cuda_parser = argparse.ArgumentParser(add_help=False)
     cuda_parser.add_argument("--cuda-device", type=int, default=None,
@@ -173,7 +186,9 @@ def main() -> None:
     add_default("--gamma-opt", GAMMA_OPT)
     add_default("--Gamma", GAMMA_PHON)
     add_default("--g", G_COUPLING)
-    add_default("--N-photons", N_PHOTON_MODES)
+    requested_n_photons = int(option_value(sweep_argv, "--N-photons") or N_PHOTON_MODES)
+    add_default("--N-photons", requested_n_photons)
+    add_default("--N-phonons", 2 if PHONON_LAYOUT == "shared_two" else requested_n_photons - 1)
     add_default("--n-paths", N_PATHS)
     add_default("--nE", N_PUMP_POINTS)
     add_default("--E-min", E_MIN_OVER_E2 * E2)
@@ -190,11 +205,11 @@ def main() -> None:
     if not has_option(sweep_argv, "--cache-dir"):
         cache_tag = (f"rk{cuda_args.rk_substeps}_lags{cuda_args.g1_lags}_"
                      f"orig{cuda_args.g1_origins}")
-        defaults += ["--cache-dir", str(ROOT / "data" / "nth_cuda_cache" / cache_tag)]
+        defaults += ["--cache-dir", str(ROOT / "data" / f"{PIPELINE_NAME}_cache" / cache_tag)]
     if not has_option(sweep_argv, "--out"):
-        defaults += ["--out", str(ROOT / "data" / "nth_sweep_cuda.json")]
+        defaults += ["--out", str(ROOT / "data" / f"{PIPELINE_NAME}.json")]
     if not has_option(sweep_argv, "--log") and not has_option(sweep_argv, "--no-log"):
-        defaults += ["--log", str(ROOT / "data" / "sweep_nth_cuda.log")]
+        defaults += ["--log", str(ROOT / "data" / f"{PIPELINE_NAME}.log")]
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import nth_sweep
@@ -217,11 +232,12 @@ def main() -> None:
     if out_arg is None:
         out_arg = next((sweep_argv[i + 1] for i, x in enumerate(sweep_argv[:-1])
                         if x == "--out"), None)
-    out_path = Path(out_arg) if out_arg else ROOT / "data" / "nth_sweep_cuda.json"
+    out_path = Path(out_arg) if out_arg else ROOT / "data" / f"{PIPELINE_NAME}.json"
     with out_path.open(encoding="utf-8") as f:
         result = json.load(f)
     result.setdefault("meta", {})["backend"] = "cuda_cpp"
-    result["meta"]["thermal_control"] = "TEMPERATURES_K in scripts/nth_sweep_cuda.py"
+    result["meta"]["thermal_control"] = f"TEMPERATURES_K in scripts/{PIPELINE_NAME}.py"
+    result["meta"]["phonon_layout"] = PHONON_LAYOUT
     result["meta"]["cuda_devices"] = devices
     result["meta"]["temperature_workers"] = temperature_workers
     result["meta"]["g1_lags"] = cuda_args.g1_lags
