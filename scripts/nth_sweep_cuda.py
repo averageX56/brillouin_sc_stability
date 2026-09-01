@@ -189,6 +189,7 @@ def main() -> None:
     requested_n_photons = int(option_value(sweep_argv, "--N-photons") or N_PHOTON_MODES)
     add_default("--N-photons", requested_n_photons)
     add_default("--N-phonons", 2 if PHONON_LAYOUT == "shared_two" else requested_n_photons - 1)
+    add_default("--phonon-layout", PHONON_LAYOUT)
     add_default("--n-paths", N_PATHS)
     add_default("--nE", N_PUMP_POINTS)
     add_default("--E-min", E_MIN_OVER_E2 * E2)
