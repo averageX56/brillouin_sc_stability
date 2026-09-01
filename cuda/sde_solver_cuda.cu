@@ -191,7 +191,8 @@ __device__ void rhs_device(const double2* a, const double2* b, double E, int n_p
     for (int p = 0; p < n_b; ++p) {
         double2 s = z();
         if (USE_PAIRWISE_PHONONS) {
-            s = mul(conjz(a[p]), a[p + 1]);
+            // Matches the photon equations: b_p is sourced by a_p a^*_{p+1}.
+            s = mul(a[p], conjz(a[p + 1]));
         } else {
             for (int j = p; j + 1 < n_ph; j += 2)
                 s = add(s, mul(conjz(a[j]), a[j + 1]));
@@ -344,7 +345,7 @@ void rhs_host(const std::vector<C>& a, const C* b, double E, const Config& c,
     for (int p = 0; p < phonon_count(c.n_ph); ++p) {
         C s = 0.0;
         if (USE_PAIRWISE_PHONONS) {
-            s = std::conj(a[p]) * a[p + 1];
+            s = a[p] * std::conj(a[p + 1]);
         } else {
             for (int j = p; j + 1 < c.n_ph; j += 2) s += std::conj(a[j]) * a[j + 1];
         }
