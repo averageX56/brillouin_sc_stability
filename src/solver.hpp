@@ -387,8 +387,8 @@ inline Paths integrate_paths(double E, const State& x0, const Params& p,
   // --- Strang splitting precomputation: exact linear + OU flow over dt/2. ---
   // Each complex variable obeys dy/dt = -c y + f in the linear part:
   //   photons k:  c = gammas[k]/2,                    f = -iE (k = 0 only)
-  //   b1:         c = gammas[b1]/2 - i*corr,          f = 0
-  //   b2:         c = gammas[b2]/2,                   f = 0
+  //   first b:    c = gammas[b1]/2 - i*corr,          f = 0
+  //   other b_k:  c = gammas[bk]/2,                   f = 0
   // Exact flow over h: y -> ec*y + fi, ec = exp(-c h), fi = f*(1-ec)/c.
   // Phonon noise over h is the exact OU transition: independent Gaussian on
   // each quadrature with variance D0*(1 - exp(-Gamma*h))/Gamma (no smallness
@@ -396,7 +396,7 @@ inline Paths integrate_paths(double E, const State& x0, const Params& p,
   const double h_half = 0.5 * dt;
   std::array<cdouble, MAX_NVAR> lin_ec{};   // decay factors
   std::array<cdouble, MAX_NVAR> lin_fi{};   // inhomogeneous (pump) increments
-  std::array<double, N_PHON> ou_sig{};      // per-quadrature noise std devs
+  std::array<double, MAX_PHONONS> ou_sig{}; // per-quadrature noise std devs
   if (cfg.scheme == Scheme::Splitting) {
     for (int j = 0; j < nvar; ++j) {
       cdouble c = p.gammas[j] / 2.0;
@@ -407,7 +407,7 @@ inline Paths integrate_paths(double E, const State& x0, const Params& p,
       if (j == 0) f = cdouble(0.0, -E);
       lin_fi[j] = (std::abs(c) > 1e-300) ? f * (1.0 - ec) / c : f * h_half;
     }
-    for (int k = 0; k < N_PHON; ++k) {
+    for (int k = 0; k < p.n_phon(); ++k) {
       const double G = p.gammas[p.phon_index(k)].real();
       const double var = (G > 1e-300)
                              ? p.D0[k] * (1.0 - std::exp(-G * h_half)) / G
@@ -424,7 +424,7 @@ inline Paths integrate_paths(double E, const State& x0, const Params& p,
     Xoshiro256pp rng(cfg.seed, static_cast<std::uint64_t>(ip));
 
     State X = x0;
-    for (int k = 0; k < N_PHON; ++k) {
+    for (int k = 0; k < p.n_phon(); ++k) {
       const double sg = thermal_sigma(p, k);
       if (sg > 0.0) {
         const int jb = p.phon_index(k);
@@ -439,7 +439,7 @@ inline Paths integrate_paths(double E, const State& x0, const Params& p,
     auto lin_half = [&](State& x) {
       for (int j = 0; j < nvar; ++j)
         set_cvar(x, nvar, j, lin_ec[j] * cvar(x, nvar, j) + lin_fi[j]);
-      for (int k = 0; k < N_PHON; ++k) {
+      for (int k = 0; k < p.n_phon(); ++k) {
         const int jb = p.phon_index(k);
         const cdouble eta(rng.draw(cfg.noise) * ou_sig[k],
                           rng.draw(cfg.noise) * ou_sig[k]);
@@ -475,7 +475,7 @@ inline Paths integrate_paths(double E, const State& x0, const Params& p,
             for (int i = 0; i < dim; ++i) inc[i] += cols[j][i] * dW;
           }
         } else {
-          std::array<double, M_NOISE> dW{}, dZ{};
+          std::array<double, MAX_M_NOISE> dW{}, dZ{};
           if (cfg.noise == NoiseKind::Gauss) {
             // Correlated pair (dW, dZ): dZ = dt^{3/2}(u1 + u2/sqrt(3))/2, so
             // E dZ^2 = dt^3/3 and E dW dZ = dt^2/2 (K&P, Problem 1.3.5).
