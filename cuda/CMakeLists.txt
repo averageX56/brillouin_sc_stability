@@ -11,3 +11,16 @@ set_target_properties(sde_solver_cuda PROPERTIES
     CUDA_ARCHITECTURES native)
 target_compile_options(sde_solver_cuda PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;-lineinfo>)
+
+# Independent-link model: N photon modes and N-1 phonon modes, with b_j
+# coupling only the adjacent pair (a_j, a_{j+1}).  It is deliberately a
+# separate executable so existing shared-two-phonon runs remain reproducible.
+add_executable(sde_solver_pairwise_cuda sde_solver_cuda.cu)
+target_compile_definitions(sde_solver_pairwise_cuda PRIVATE PAIRWISE_PHONONS=1)
+target_compile_features(sde_solver_pairwise_cuda PRIVATE cxx_std_17 cuda_std_17)
+target_link_libraries(sde_solver_pairwise_cuda PRIVATE CUDA::cudart CUDA::curand)
+set_target_properties(sde_solver_pairwise_cuda PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    CUDA_ARCHITECTURES native)
+target_compile_options(sde_solver_pairwise_cuda PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;-lineinfo>)
